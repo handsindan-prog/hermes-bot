@@ -1,227 +1,39 @@
-import os
-import re
-import logging
-import tempfile
-import httpx
-import trafilatura
-from dotenv import load_dotenv
-from supabase import create_client
-from telegram import Update
-from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
+"""
+Hermes Telegram bot — the capture surface.
 
-load_dotenv()
+Everything reusable (extraction, chunking, embedding, storage, retrieval,
+reasoning) lives in hermes_core so agents share it. This file is only the
+Telegram wiring.
+"""
+
+import logging
+import os
+import tempfile
+
+import trafilatura
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+import hermes_core as hc
+from hermes_core import EXTRACTORS, URL_RE, clean_text, normalise_url
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
+# httpx logs request URLs at INFO, which prints the bot token. Leaked it three
+# times before this line existed.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("hermes")
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ALLOWED = os.getenv("ALLOWED_USER_ID", "").strip()
-NVIDIA_KEY = os.environ["NVIDIA_API_KEY"]
-OPENROUTER_KEY = os.environ["OPENROUTER_API_KEY"]
-
-EMBED_URL = "https://integrate.api.nvidia.com/v1/embeddings"
-EMBED_MODEL = "nvidia/nv-embedqa-e5-v5"
-CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
-CHAT_MODEL = "anthropic/claude-sonnet-5"
-
-CHUNK_WORDS = 250
-CHUNK_OVERLAP = 40
-BATCH_SIZE = 16
-
-URL_RE = re.compile(r"(?:https?://|www\.)[^\s<>\"']+", re.IGNORECASE)
-
-SYSTEM_PROMPT = (
-    "You are Hermes, a personal memory assistant. Answer using the retrieved "
-    "memories provided. Be concise and direct. If the memories don't contain "
-    "the answer, say so plainly rather than guessing. Cite the source name "
-    "and date where useful."
-)
-
-supabase = create_client(
-    os.environ["SUPABASE_URL"],
-    os.environ["SUPABASE_SERVICE_KEY"],
-)
-
-
-# ---------- sanitising ----------
-
-def clean_text(text: str) -> str:
-    """Strip NUL bytes and control chars Postgres refuses to store."""
-    if not text:
-        return ""
-    text = text.replace("\x00", "")
-    text = "".join(ch for ch in text if ch in "\n\t" or ord(ch) >= 32)
-    return text
-
-
-def normalise_url(url: str) -> str:
-    url = url.rstrip(".,);:'\"")
-    if not url.lower().startswith(("http://", "https://")):
-        url = "https://" + url
-    return url
-
-
-# ---------- text extraction ----------
-
-def extract_pdf(path: str) -> str:
-    from pypdf import PdfReader
-    reader = PdfReader(path)
-    return "\n\n".join((p.extract_text() or "") for p in reader.pages)
-
-
-def extract_docx(path: str) -> str:
-    import docx
-    d = docx.Document(path)
-    parts = [p.text for p in d.paragraphs if p.text.strip()]
-    for table in d.tables:
-        for row in table.rows:
-            cells = [c.text.strip() for c in row.cells if c.text.strip()]
-            if cells:
-                parts.append(" | ".join(cells))
-    return "\n".join(parts)
-
-
-def extract_pptx(path: str) -> str:
-    from pptx import Presentation
-    prs = Presentation(path)
-    parts = []
-    for i, slide in enumerate(prs.slides, 1):
-        bits = [
-            shape.text.strip()
-            for shape in slide.shapes
-            if hasattr(shape, "text") and shape.text.strip()
-        ]
-        if slide.has_notes_slide:
-            notes = slide.notes_slide.notes_text_frame.text.strip()
-            if notes:
-                bits.append(f"(notes) {notes}")
-        if bits:
-            parts.append(f"Slide {i}: " + "\n".join(bits))
-    return "\n\n".join(parts)
-
-
-EXTRACTORS = {
-    ".pdf": extract_pdf,
-    ".docx": extract_docx,
-    ".pptx": extract_pptx,
-    ".txt": lambda p: open(p, encoding="utf-8", errors="ignore").read(),
-    ".md": lambda p: open(p, encoding="utf-8", errors="ignore").read(),
-}
-
-
-# ---------- chunking ----------
-
-def chunk_text(text: str) -> list[str]:
-    text = clean_text(text)
-    text = re.sub(r"\n{3,}", "\n\n", text).strip()
-    words = text.split()
-    if not words:
-        return []
-    if len(words) <= CHUNK_WORDS:
-        return [" ".join(words)]
-
-    chunks = []
-    step = CHUNK_WORDS - CHUNK_OVERLAP
-    for i in range(0, len(words), step):
-        piece = " ".join(words[i:i + CHUNK_WORDS])
-        if len(piece.split()) > 20:
-            chunks.append(piece)
-    return chunks
-
-
-# ---------- embedding ----------
-
-async def embed_batch(texts: list[str], input_type: str) -> list[list[float]]:
-    out = []
-    async with httpx.AsyncClient(timeout=60) as client:
-        for i in range(0, len(texts), BATCH_SIZE):
-            batch = texts[i:i + BATCH_SIZE]
-            r = await client.post(
-                EMBED_URL,
-                headers={"Authorization": f"Bearer {NVIDIA_KEY}"},
-                json={
-                    "input": batch,
-                    "model": EMBED_MODEL,
-                    "input_type": input_type,
-                    "truncate": "END",
-                },
-            )
-            r.raise_for_status()
-            data = sorted(r.json()["data"], key=lambda d: d["index"])
-            out.extend(d["embedding"] for d in data)
-    return out
-
-
-async def embed(text: str, input_type: str) -> list[float]:
-    return (await embed_batch([text], input_type))[0]
-
-
-# ---------- storing ----------
-
-async def store_chunks(chunks: list[str], source: str, meta: dict) -> int:
-    if not chunks:
-        return 0
-    vectors = await embed_batch(chunks, "passage")
-    rows = [
-        {
-            "content": c,
-            "embedding": v,
-            "source": source,
-            "metadata": {**meta, "chunk": i + 1, "chunks": len(chunks)},
-        }
-        for i, (c, v) in enumerate(zip(chunks, vectors))
-    ]
-    for i in range(0, len(rows), 50):
-        supabase.table("memories").insert(rows[i:i + 50]).execute()
-    return len(rows)
-
-
-# ---------- retrieval ----------
-
-async def search(query: str, limit: int = 8) -> list[dict]:
-    vec = await embed(query, "query")
-    res = supabase.rpc("match_memories", {
-        "query_embedding": vec,
-        "match_threshold": 0.25,
-        "match_count": limit,
-    }).execute()
-    return res.data or []
-
-
-async def reason(question: str, memories: list[dict]) -> str:
-    if memories:
-        parts = []
-        for m in memories:
-            label = m["metadata"].get("title") or m["metadata"].get("file_name") or m["source"]
-            parts.append(f"[{m['created_at'][:10]} · {label}] {m['content']}")
-        context = "\n\n".join(parts)
-    else:
-        context = "(no relevant memories found)"
-
-    async with httpx.AsyncClient(timeout=90) as client:
-        r = await client.post(
-            CHAT_URL,
-            headers={
-                "Authorization": f"Bearer {OPENROUTER_KEY}",
-                "HTTP-Referer": "https://circularsmart.com",
-                "X-Title": "Hermes",
-            },
-            json={
-                "model": CHAT_MODEL,
-                "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content":
-                        f"Retrieved memories:\n\n{context}\n\n---\n\nQuestion: {question}"},
-                ],
-                "max_tokens": 1200,
-            },
-        )
-        r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"]
 
 
 # ---------- handlers ----------
@@ -244,14 +56,15 @@ async def recall(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /recall search terms")
         return
     try:
-        rows = await search(query, limit=5)
+        rows = await hc.search(query, limit=5)
         if not rows:
             await update.message.reply_text("Nothing relevant found.")
             return
-        lines = []
-        for r in rows:
-            label = r["metadata"].get("title") or r["metadata"].get("file_name") or r["source"]
-            lines.append(f"[{r['created_at'][:10]} · {label} · {round(r['similarity'], 2)}]\n{r['content'][:400]}")
+        lines = [
+            f"[{r['created_at'][:10]} · {hc.label_of(r)} · {round(r['similarity'], 2)}]\n"
+            f"{r['content'][:400]}"
+            for r in rows
+        ]
         await update.message.reply_text("\n\n".join(lines)[:4000])
     except Exception as e:
         log.exception("Recall failed")
@@ -267,12 +80,44 @@ async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.chat.send_action("typing")
     try:
-        rows = await search(question)
-        answer = await reason(question, rows)
-        await update.message.reply_text(answer[:4000])
+        rows = await hc.search(question)
+        result = await hc.reason(question, rows)
+        answer = result.text[:4000]
+        if result.truncated:
+            answer += "\n\n(cut off at the length limit — ask something narrower)"
+        await update.message.reply_text(answer)
     except Exception as e:
         log.exception("Ask failed")
         await update.message.reply_text(f"Ask failed: {e}")
+
+
+async def runs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Last few agent runs — the read side of the agent_runs log."""
+    if not authorised(update):
+        return
+    try:
+        rows = (
+            hc.supabase.table("agent_runs")
+            .select("agent,status,started_at,rows_written,cost_usd,error")
+            .order("started_at", desc=True)
+            .limit(10)
+            .execute()
+            .data
+        )
+        if not rows:
+            await update.message.reply_text("No agent runs logged yet.")
+            return
+        lines = []
+        for r in rows:
+            line = (f"{r['started_at'][:16].replace('T', ' ')} · {r['agent']} · "
+                    f"{r['status']} · {r['rows_written']} rows · ${float(r['cost_usd']):.4f}")
+            if r.get("error"):
+                line += f"\n   {r['error'][:180]}"
+            lines.append(line)
+        await update.message.reply_text("\n".join(lines)[:4000])
+    except Exception as e:
+        log.exception("Runs failed")
+        await update.message.reply_text(f"Runs failed: {e}")
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -298,17 +143,27 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await tg_file.download_to_drive(tmp.name)
             text = EXTRACTORS[ext](tmp.name)
 
-        chunks = chunk_text(text)
-        if not chunks:
-            await update.message.reply_text("No readable text found — is it a scanned image?")
-            return
+        result = await hc.store_document(
+            doc_key=name,
+            text=text,
+            source=ext.lstrip("."),
+            meta={
+                "file_name": name,
+                "title": os.path.splitext(name)[0],
+                "user_id": update.effective_user.id,
+            },
+        )
 
-        n = await store_chunks(chunks, ext.lstrip("."), {
-            "file_name": name,
-            "title": os.path.splitext(name)[0],
-            "user_id": update.effective_user.id,
-        })
-        await update.message.reply_text(f"Stored {name} as {n} chunks.")
+        if result.status == "empty":
+            await update.message.reply_text("No readable text found — is it a scanned image?")
+        elif result.status == "unchanged":
+            await update.message.reply_text(f"{name} is already stored and unchanged.")
+        elif result.status == "updated":
+            await update.message.reply_text(
+                f"{name} changed — replaced with {result.written} chunks."
+            )
+        else:
+            await update.message.reply_text(f"Stored {name} as {result.written} chunks.")
 
     except Exception as e:
         log.exception("Document ingest failed")
@@ -333,31 +188,29 @@ async def ingest_url(update: Update, url: str):
             await update.message.reply_text("No readable content extracted.")
             return
 
-        chunks = chunk_text(text)
-        n = await store_chunks(chunks, "web", {
-            "url": url,
-            "title": clean_text(title)[:200],
-            "user_id": update.effective_user.id,
-        })
-        await update.message.reply_text(f"Stored \"{title[:80]}\" as {n} chunks.")
+        result = await hc.store_document(
+            doc_key=url,
+            text=text,
+            source="web",
+            meta={
+                "url": url,
+                "title": clean_text(title)[:200],
+                "user_id": update.effective_user.id,
+            },
+        )
+
+        if result.status == "unchanged":
+            await update.message.reply_text(f'"{title[:80]}" unchanged since last fetch.')
+        elif result.status == "updated":
+            await update.message.reply_text(
+                f'"{title[:80]}" changed — replaced with {result.written} chunks.'
+            )
+        else:
+            await update.message.reply_text(f'Stored "{title[:80]}" as {result.written} chunks.')
 
     except Exception as e:
         log.exception("URL ingest failed")
         await update.message.reply_text(f"Failed: {e}")
-
-
-async def save_note(update: Update, text: str):
-    vec = await embed(text, "passage")
-    supabase.table("memories").insert({
-        "content": text,
-        "embedding": vec,
-        "source": "telegram",
-        "metadata": {
-            "user_id": update.effective_user.id,
-            "chat_id": update.effective_chat.id,
-            "message_id": update.message.message_id,
-        },
-    }).execute()
 
 
 async def capture(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -370,18 +223,25 @@ async def capture(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         if urls:
-            # fetch every link in the message
             for url in urls[:3]:
                 await ingest_url(update, url)
 
             # if there's real commentary alongside the link, keep that too
             remainder = URL_RE.sub("", text).strip()
             if len(remainder.split()) >= 5:
-                await save_note(update, text)
+                await hc.store_note(text, {
+                    "user_id": update.effective_user.id,
+                    "chat_id": update.effective_chat.id,
+                    "message_id": update.message.message_id,
+                })
                 await update.message.reply_text("Note saved alongside.")
             return
 
-        await save_note(update, text)
+        await hc.store_note(text, {
+            "user_id": update.effective_user.id,
+            "chat_id": update.effective_chat.id,
+            "message_id": update.message.message_id,
+        })
         await update.message.reply_text("Saved.")
 
     except Exception as e:
@@ -394,6 +254,7 @@ def main():
     app.add_handler(CommandHandler("whoami", whoami))
     app.add_handler(CommandHandler("recall", recall))
     app.add_handler(CommandHandler("ask", ask))
+    app.add_handler(CommandHandler("runs", runs))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, capture))
     log.info("Hermes starting (polling)")
