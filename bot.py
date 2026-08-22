@@ -33,15 +33,28 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("hermes")
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-ALLOWED = os.getenv("ALLOWED_USER_ID", "").strip()
+
+# Comma-separated list of Telegram user IDs. A single bare ID still works, so
+# existing .env files keep behaving exactly as before.
+#
+# This has to be a set compared member-wise, not a string compared whole: the
+# obvious "append another id" edit against the old `== ALLOWED` check locked
+# everyone out, because no single user's id equals "id1,id2".
+ALLOWED = {
+    uid.strip()
+    for uid in os.getenv("ALLOWED_USER_ID", "").split(",")
+    if uid.strip()
+}
 
 
 # ---------- handlers ----------
 
 def authorised(update: Update) -> bool:
+    # An empty allow-list means the bot is open. That is the historical
+    # behaviour and is only ever right for local testing.
     if not ALLOWED:
         return True
-    return str(update.effective_user.id) == ALLOWED
+    return str(update.effective_user.id) in ALLOWED
 
 
 async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -215,7 +228,9 @@ async def ingest_url(update: Update, url: str):
 
 async def capture(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorised(update):
-        log.warning("Rejected message from %s", update.effective_user.id)
+        user = update.effective_user
+        log.warning("Rejected message from %s (@%s, %s)",
+                    user.id, user.username, user.full_name)
         return
 
     text = clean_text(update.message.text)
