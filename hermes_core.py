@@ -121,6 +121,14 @@ def extract_docx(path: str) -> str:
     return "\n".join(parts)
 
 
+def extract_html(path: str) -> str:
+    """Saved web pages — trafilatura strips the chrome the same way it does for
+    a live fetch, so a saved article reads like a fetched one."""
+    import trafilatura
+    raw = open(path, encoding="utf-8", errors="ignore").read()
+    return trafilatura.extract(raw, include_comments=False, include_tables=True) or ""
+
+
 def extract_pptx(path: str) -> str:
     from pptx import Presentation
     prs = Presentation(path)
@@ -144,6 +152,8 @@ EXTRACTORS = {
     ".pdf": extract_pdf,
     ".docx": extract_docx,
     ".pptx": extract_pptx,
+    ".html": extract_html,
+    ".htm": extract_html,
     ".txt": lambda p: open(p, encoding="utf-8", errors="ignore").read(),
     ".md": lambda p: open(p, encoding="utf-8", errors="ignore").read(),
 }
