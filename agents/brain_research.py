@@ -155,7 +155,8 @@ def parse_json(text: str) -> dict | None:
     return None
 
 
-async def investigate(m: Marker, workspaces: list[str], run: hc.AgentRun) -> dict:
+async def investigate(m: Marker, workspaces: list[str], run: hc.AgentRun,
+                      tier: str = "smart") -> dict:
     """Search, judge, verify. Returns a result dict for the report."""
     passages: list[dict] = []
     for ws in workspaces:
@@ -190,7 +191,9 @@ async def investigate(m: Marker, workspaces: list[str], run: hc.AgentRun) -> dic
                 f"Research question, from {m.file}:\n\n{m.question}\n\n"
                 f"---\n\nRetrieved passages:\n\n{listing}"},
         ],
-        tier="smart", max_tokens=700,
+        # Nemotron bills its reasoning against max_tokens and returns its own
+        # chain-of-thought if starved, so the fast tier gets real headroom.
+        tier=tier, max_tokens=1800 if tier == "fast" else 700,
     )
     run.charge(res)
 
@@ -290,6 +293,10 @@ async def main() -> int:
     ap.add_argument("--also-search", nargs="*", default=[],
                     help="additional workspaces to search (claims still file under --workspace)")
     ap.add_argument("--subdir", default="", help="limit to a subdirectory of brain/, e.g. vantage")
+    ap.add_argument("--tier", choices=("smart", "fast"), default="smart",
+                    help="smart = Claude via OpenRouter; fast = Nemotron via NVIDIA NIM. "
+                         "The verbatim-quote check applies either way, so a weaker judge "
+                         "can propose a weak claim but cannot invent a source.")
     ap.add_argument("--cap", type=float, default=0.50, help="spend cap in USD")
     ap.add_argument("--limit", type=int, default=0, help="stop after N markers (0 = all)")
     ap.add_argument("--dry-run", action="store_true", help="list markers and exit")
@@ -320,10 +327,10 @@ async def main() -> int:
     results = []
 
     async with hc.AgentRun(AGENT, workspace=a.workspace, spend_cap_usd=a.cap,
-                           detail={"brain": str(scope), "searched": workspaces}) as run:
+                           detail={"brain": str(scope), "searched": workspaces, "tier": a.tier}) as run:
         for i, m in enumerate(markers, 1):
             print(f"[{i}/{len(markers)}] {m}", file=sys.stderr)
-            results.append(await investigate(m, workspaces, run))
+            results.append(await investigate(m, workspaces, run, tier=a.tier))
             run.check_cap()
 
         text = report(results, workspaces, run)
