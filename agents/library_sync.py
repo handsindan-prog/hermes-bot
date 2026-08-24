@@ -69,7 +69,11 @@ class FolderSource:
     def docs(self) -> list[Doc]:
         out: list[Doc] = []
         for p in sorted(self.root.rglob("*")):
-            if not p.is_file() or p.name.startswith("."):
+            # "~$Foo.docx" is the lock file Word leaves beside an open
+            # document, not a document. It is a valid zip container with no
+            # Office parts, so it fails at extraction rather than at the
+            # extension check.
+            if not p.is_file() or p.name.startswith((".", "~$")):
                 continue
             if any(part in self.skip_dirs for part in p.parts):
                 continue
