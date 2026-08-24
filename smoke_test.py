@@ -33,6 +33,7 @@ def check(label: str, ok: bool, detail: str = "") -> None:
 
 def cleanup() -> None:
     hc.supabase.table("memories").delete().eq("doc_key", DOC).execute()
+    hc.supabase.table("agent_claims").delete().eq("target", DOC).execute()
     hc.supabase.table("agent_runs").delete().eq("agent", AGENT).execute()
 
 
@@ -91,6 +92,52 @@ async def main() -> None:
               .eq("agent", AGENT).order("started_at", desc=True).limit(1).execute().data)
     check("over-cap run recorded as halted",
           bool(halted) and halted[0]["status"] == "halted", str(halted))
+
+    # --- workspaces keep products apart ---
+    r_a = await hc.store_document(DOC, TEXT_A, "test", {"title": "ws A"}, workspace="smoke-a")
+    r_b = await hc.store_document(DOC, TEXT_B, "test", {"title": "ws B"}, workspace="smoke-b")
+    check("same doc_key coexists in two workspaces",
+          r_a.status == "stored" and r_b.status == "stored",
+          f"{r_a} / {r_b}")
+
+    rows_a = (hc.supabase.table("memories").select("content")
+              .eq("workspace", "smoke-a").eq("doc_key", DOC).execute().data)
+    check("workspace A untouched by write to B",
+          any("periwinkle telescope" in r["content"] for r in rows_a))
+
+    hits = await hc.search("marmalade lighthouse", limit=10, workspace="smoke-b")
+    check("search scoped to a workspace returns only that workspace",
+          bool(hits) and all(h.get("workspace") == "smoke-b" for h in hits),
+          f"{len(hits)} hits, workspaces={sorted({h.get('workspace') for h in hits})}")
+
+    # --- claims are proposals, never facts ---
+    async with hc.AgentRun(AGENT, workspace="smoke-a") as run:
+        cid = run.claim(hc.Claim(
+            target=DOC, marker="NEEDS RESEARCH: test",
+            claim="Telecoms is the nearest adjacency.",
+            evidence="telecoms, commercial waste, and managed print are the three nearest adjacencies",
+            source_url="https://example.com/brief", source_kind="corpus",
+            confidence="high", fetched_at="2026-08-24",
+        ))
+    check("claim recorded against the run", cid > 0)
+
+    open_ = hc.open_claims(workspace="smoke-a", target=DOC)
+    check("claim is 'proposed', not fact", bool(open_) and open_[0]["status"] == "proposed")
+
+    model_claim = hc.Claim(target=DOC, claim="Acme raised $40M.",
+                           source_kind="model", confidence="high")
+    check("a model-sourced claim is forced to unverified",
+          model_claim.confidence == "unverified",
+          f"got {model_claim.confidence!r}")
+
+    try:
+        hc.Claim(target=DOC, claim="x", confidence="pretty sure")
+        check("invalid confidence rejected", False, "no error raised")
+    except ValueError:
+        check("invalid confidence rejected", True)
+
+    for ws in ("smoke-a", "smoke-b"):
+        hc.supabase.table("memories").delete().eq("workspace", ws).execute()
 
     cleanup()
     left = hc.supabase.table("memories").select("id").eq("doc_key", DOC).execute().data

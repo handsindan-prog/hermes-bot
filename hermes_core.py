@@ -70,6 +70,10 @@ SYSTEM_PROMPT = (
     "and date where useful."
 )
 
+# Which product/entity this process writes on behalf of. One Hermes serves a
+# portfolio; rows without a workspace would be unattributable later.
+WORKSPACE = os.getenv("HERMES_WORKSPACE", "circularsmart")
+
 supabase = create_client(
     os.environ["SUPABASE_URL"],
     os.environ["SUPABASE_SERVICE_KEY"],
@@ -204,6 +208,7 @@ class IngestResult:
     written: int = 0
     skipped: int = 0
     doc_key: str = ""
+    workspace: str = ""
 
     def __str__(self) -> str:
         if self.status == "unchanged":
@@ -232,6 +237,7 @@ async def store_document(
     text: str,
     source: str,
     meta: dict | None = None,
+    workspace: str | None = None,
 ) -> IngestResult:
     """
     Idempotent document ingestion.
@@ -243,15 +249,19 @@ async def store_document(
     out of match_memories.
     """
     meta = dict(meta or {})
+    ws = workspace or WORKSPACE
     chunks = chunk_text(text)
     if not chunks:
-        return IngestResult("empty", doc_key=doc_key)
+        return IngestResult("empty", doc_key=doc_key, workspace=ws)
 
     doc_hash = sha256(clean_text(text))
 
+    # Document identity is (workspace, doc_key) — the same competitor page can
+    # legitimately sit in two products' corpora without one clobbering the other.
     existing = (
         supabase.table("memories")
         .select("doc_hash")
+        .eq("workspace", ws)
         .eq("doc_key", doc_key)
         .limit(1)
         .execute()
@@ -259,12 +269,12 @@ async def store_document(
     )
 
     if existing and existing[0].get("doc_hash") == doc_hash:
-        return IngestResult("unchanged", skipped=len(chunks), doc_key=doc_key)
+        return IngestResult("unchanged", skipped=len(chunks), doc_key=doc_key, workspace=ws)
 
     status = "stored"
     if existing:
         # Known document, new content: replace rather than accumulate.
-        supabase.table("memories").delete().eq("doc_key", doc_key).execute()
+        supabase.table("memories").delete().eq("workspace", ws).eq("doc_key", doc_key).execute()
         status = "updated"
 
     pairs = _dedupe_chunks(chunks)
@@ -275,6 +285,7 @@ async def store_document(
             "content": c,
             "embedding": v,
             "source": source,
+            "workspace": ws,
             "doc_key": doc_key,
             "doc_hash": doc_hash,
             "content_hash": h,
@@ -288,7 +299,7 @@ async def store_document(
             supabase.table("memories")
             .upsert(
                 rows[i:i + INSERT_BATCH],
-                on_conflict="doc_key,content_hash",
+                on_conflict="workspace,doc_key,content_hash",
                 ignore_duplicates=True,
             )
             .execute()
@@ -299,10 +310,12 @@ async def store_document(
         written=len(rows),
         skipped=len(chunks) - len(pairs),
         doc_key=doc_key,
+        workspace=ws,
     )
 
 
-async def store_note(content: str, meta: dict | None = None, source: str = "telegram") -> int:
+async def store_note(content: str, meta: dict | None = None, source: str = "telegram",
+                     workspace: str | None = None) -> int:
     """A loose note has no document identity; the DB trigger assigns it
     doc_key = 'note:<id>' once the row has an id."""
     vec = await embed(content, "passage")
@@ -310,6 +323,7 @@ async def store_note(content: str, meta: dict | None = None, source: str = "tele
         "content": content,
         "embedding": vec,
         "source": source,
+        "workspace": workspace or WORKSPACE,
         "metadata": meta or {},
     }).execute()
     return 1
@@ -317,12 +331,21 @@ async def store_note(content: str, meta: dict | None = None, source: str = "tele
 
 # ---------- retrieval ----------
 
-async def search(query: str, limit: int = 8, threshold: float = MATCH_THRESHOLD) -> list[dict]:
+async def search(
+    query: str,
+    limit: int = 8,
+    threshold: float = MATCH_THRESHOLD,
+    workspace: str | None = None,
+    source: str | None = None,
+) -> list[dict]:
+    """workspace=None searches the whole corpus; pass one to scope to a product."""
     vec = await embed(query, "query")
     res = supabase.rpc("match_memories", {
         "query_embedding": vec,
         "match_threshold": threshold,
         "match_count": limit,
+        "filter_source": source,
+        "filter_workspace": workspace,
     }).execute()
     return res.data or []
 
@@ -459,6 +482,66 @@ async def reason(question: str, memories: list[dict], tier: str = "smart") -> Ch
     )
 
 
+# ---------- claims ----------
+
+CONFIDENCE = ("verified", "high", "medium", "low", "unverified")
+
+
+@dataclass
+class Claim:
+    """One thing an agent believes, and why.
+
+    `evidence` is the verbatim text the claim rests on — not a paraphrase.
+    Without it a reviewer cannot check the claim without redoing the research,
+    which defeats the point of the review.
+
+    A claim whose source_kind is 'model' is forced to 'unverified' by a database
+    constraint no matter what confidence is passed, because a model's certainty
+    about an entity is not evidence about that entity.
+    """
+
+    target: str                     # brain file this answers into
+    claim: str
+    marker: str = ""                # which [NEEDS RESEARCH] it addresses
+    evidence: str = ""              # verbatim quote
+    source_url: str = ""
+    source_kind: str = "corpus"     # corpus | web | apify | model
+    confidence: str = "unverified"
+    fetched_at: str | None = None
+
+    def __post_init__(self):
+        if self.confidence not in CONFIDENCE:
+            raise ValueError(f"confidence must be one of {CONFIDENCE}, got {self.confidence!r}")
+        if self.source_kind == "model":
+            self.confidence = "unverified"
+
+
+def record_claim(c: Claim, run_id: int | None = None, workspace: str | None = None) -> int:
+    row = supabase.table("agent_claims").insert({
+        "run_id": run_id,
+        "workspace": workspace or WORKSPACE,
+        "target": c.target,
+        "marker": c.marker or None,
+        "claim": c.claim,
+        "evidence": c.evidence or None,
+        "source_url": c.source_url or None,
+        "source_kind": c.source_kind,
+        "confidence": c.confidence,
+        "fetched_at": c.fetched_at,
+    }).execute().data
+    return row[0]["id"] if row else 0
+
+
+def open_claims(workspace: str | None = None, target: str | None = None) -> list[dict]:
+    q = (supabase.table("agent_claims").select("*")
+         .eq("workspace", workspace or WORKSPACE)
+         .eq("status", "proposed")
+         .order("created_at", desc=True))
+    if target:
+        q = q.eq("target", target)
+    return q.execute().data or []
+
+
 # ---------- run logging ----------
 
 class SpendCapExceeded(RuntimeError):
@@ -483,6 +566,7 @@ class AgentRun:
     """
 
     agent: str
+    workspace: str = ""
     spend_cap_usd: float | None = None
     cap_window_hours: int = 24
     detail: dict = field(default_factory=dict)
@@ -512,10 +596,24 @@ class AgentRun:
         self.output_tokens += result.output_tokens
         self.cost_usd += result.cost_usd
 
+    def claim(self, c: "Claim") -> int:
+        """Record a proposal for human review. Never writes to memories — a
+        claim is not a fact until somebody accepts it."""
+        return record_claim(c, run_id=self.run_id, workspace=self.ws)
+
+    @property
+    def ws(self) -> str:
+        return self.workspace or WORKSPACE
+
     def window_spend(self) -> float:
+        """Spend across the window for this workspace — not just this run, so an
+        agent wedged in a retry loop still trips its own cap."""
         since = (datetime.now(timezone.utc)
                  - timedelta(hours=self.cap_window_hours)).isoformat()
-        res = supabase.rpc("agent_spend_since", {"since": since}).execute()
+        res = supabase.rpc("agent_spend_since", {
+            "since": since,
+            "filter_workspace": self.ws,
+        }).execute()
         return float(res.data or 0)
 
     def check_cap(self) -> None:
@@ -534,6 +632,7 @@ class AgentRun:
     async def __aenter__(self) -> "AgentRun":
         row = supabase.table("agent_runs").insert({
             "agent": self.agent,
+            "workspace": self.ws,
             "status": "running",
             "detail": self.detail,
         }).execute().data
