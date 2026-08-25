@@ -36,7 +36,19 @@ NVIDIA_KEY = os.environ["NVIDIA_API_KEY"]
 OPENROUTER_KEY = os.environ["OPENROUTER_API_KEY"]
 
 EMBED_URL = "https://integrate.api.nvidia.com/v1/embeddings"
-EMBED_MODEL = "nvidia/nv-embedqa-e5-v5"
+# nv-embedqa-e5-v5 reached end of life on 2026-08-25T09:00Z and now returns 410.
+# nemotron-3-embed-1b is the only embedding model this account can actually call
+# — the others in /v1/models 404 — and it is asymmetric like the old one.
+#
+# 2048 dims, which the original build rejected because ivfflat and hnsw cap at
+# 2000. That no longer applies: the index was dropped in migration 002 after it
+# turned out to be suppressing search, and exact search has no dimension limit.
+#
+# Changing this model invalidates every stored vector. They live in a different
+# space and are not comparable, so the corpus must be re-embedded — see
+# agents/reembed.py.
+EMBED_MODEL = os.getenv("HERMES_EMBED_MODEL", "nvidia/nemotron-3-embed-1b")
+EMBED_DIMS = 2048
 
 # Two tiers on purpose. An agent sweeping thirty pages is ~90% mechanical
 # work — classify, extract, first-pass summarise — and paying Claude rates
