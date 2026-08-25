@@ -121,6 +121,64 @@ def extract_docx(path: str) -> str:
     return "\n".join(parts)
 
 
+# A single sheet can hold tens of thousands of rows. Past a few hundred it is
+# a database, not a document, and indexing it whole would swamp the corpus with
+# one file. Truncation is reported in the text rather than done silently.
+MAX_SHEET_ROWS = 500
+
+
+def extract_xlsx(path: str) -> str:
+    """Spreadsheets as readable text — one block per sheet, rows pipe-delimited.
+
+    data_only=True reads the values Excel caches alongside each formula. The
+    formula string "=SUM(B2:B40)" is noise in a semantic index; the number it
+    produced is not. A workbook written by a tool that never cached its values
+    extracts as empty, which library_sync reports as "no extractable text"
+    rather than storing a blank document.
+    """
+    from openpyxl import load_workbook
+
+    wb = load_workbook(path, data_only=True, read_only=True)
+    try:
+        blocks = []
+        for ws in wb.worksheets:
+            rows = []
+            for i, row in enumerate(ws.iter_rows(values_only=True)):
+                if i >= MAX_SHEET_ROWS:
+                    rows.append(f"(… further rows beyond {MAX_SHEET_ROWS} not indexed)")
+                    break
+                cells = [str(c).strip() for c in row if c is not None and str(c).strip()]
+                if cells:
+                    rows.append(" | ".join(cells))
+            if rows:
+                # The sheet name is often the only thing naming what the numbers
+                # are, so it goes in the text rather than the metadata.
+                blocks.append(f"Sheet: {ws.title}\n" + "\n".join(rows))
+        return "\n\n".join(blocks)
+    finally:
+        wb.close()
+
+
+def extract_csv(path: str) -> str:
+    import csv
+    with open(path, newline="", encoding="utf-8", errors="ignore") as fh:
+        sample = fh.read(8192)
+        fh.seek(0)
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
+        except csv.Error:
+            dialect = csv.excel
+        rows = []
+        for i, row in enumerate(csv.reader(fh, dialect)):
+            if i >= MAX_SHEET_ROWS:
+                rows.append(f"(… further rows beyond {MAX_SHEET_ROWS} not indexed)")
+                break
+            cells = [c.strip() for c in row if c and c.strip()]
+            if cells:
+                rows.append(" | ".join(cells))
+    return "\n".join(rows)
+
+
 def extract_html(path: str) -> str:
     """Saved web pages — trafilatura strips the chrome the same way it does for
     a live fetch, so a saved article reads like a fetched one."""
@@ -154,6 +212,9 @@ EXTRACTORS = {
     ".pptx": extract_pptx,
     ".html": extract_html,
     ".htm": extract_html,
+    ".xlsx": extract_xlsx,
+    ".xlsm": extract_xlsx,
+    ".csv": extract_csv,
     ".txt": lambda p: open(p, encoding="utf-8", errors="ignore").read(),
     ".md": lambda p: open(p, encoding="utf-8", errors="ignore").read(),
 }
