@@ -553,26 +553,30 @@ async def reason(question: str, memories: list[dict], tier: str = "smart") -> Ch
     )
 
 
-# ---------- claims ----------
+# ---------- findings ----------
+#
+# Deliberately not "claim": Claim is one of the six Vantage modules, and the
+# research agent's own report used the word in both senses at once. A finding
+# is what it is — something discovered, carrying evidence.
 
 CONFIDENCE = ("verified", "high", "medium", "low", "unverified")
 
 
 @dataclass
-class Claim:
+class Finding:
     """One thing an agent believes, and why.
 
-    `evidence` is the verbatim text the claim rests on — not a paraphrase.
-    Without it a reviewer cannot check the claim without redoing the research,
+    `evidence` is the verbatim text the finding rests on — not a paraphrase.
+    Without it a reviewer cannot check the finding without redoing the research,
     which defeats the point of the review.
 
-    A claim whose source_kind is 'model' is forced to 'unverified' by a database
-    constraint no matter what confidence is passed, because a model's certainty
-    about an entity is not evidence about that entity.
+    A finding whose source_kind is 'model' is forced to 'unverified' by a
+    database constraint no matter what confidence is passed, because a model's
+    certainty about an entity is not evidence about that entity.
     """
 
     target: str                     # brain file this answers into
-    claim: str
+    statement: str                  # what is asserted, in one sentence
     marker: str = ""                # which [NEEDS RESEARCH] it addresses
     evidence: str = ""              # verbatim quote
     source_url: str = ""
@@ -587,24 +591,24 @@ class Claim:
             self.confidence = "unverified"
 
 
-def record_claim(c: Claim, run_id: int | None = None, workspace: str | None = None) -> int:
-    row = supabase.table("agent_claims").insert({
+def record_finding(f: Finding, run_id: int | None = None, workspace: str | None = None) -> int:
+    row = supabase.table("agent_findings").insert({
         "run_id": run_id,
         "workspace": workspace or WORKSPACE,
-        "target": c.target,
-        "marker": c.marker or None,
-        "claim": c.claim,
-        "evidence": c.evidence or None,
-        "source_url": c.source_url or None,
-        "source_kind": c.source_kind,
-        "confidence": c.confidence,
-        "fetched_at": c.fetched_at,
+        "target": f.target,
+        "marker": f.marker or None,
+        "statement": f.statement,
+        "evidence": f.evidence or None,
+        "source_url": f.source_url or None,
+        "source_kind": f.source_kind,
+        "confidence": f.confidence,
+        "fetched_at": f.fetched_at,
     }).execute().data
     return row[0]["id"] if row else 0
 
 
-def open_claims(workspace: str | None = None, target: str | None = None) -> list[dict]:
-    q = (supabase.table("agent_claims").select("*")
+def open_findings(workspace: str | None = None, target: str | None = None) -> list[dict]:
+    q = (supabase.table("agent_findings").select("*")
          .eq("workspace", workspace or WORKSPACE)
          .eq("status", "proposed")
          .order("created_at", desc=True))
@@ -667,10 +671,10 @@ class AgentRun:
         self.output_tokens += result.output_tokens
         self.cost_usd += result.cost_usd
 
-    def claim(self, c: "Claim") -> int:
-        """Record a proposal for human review. Never writes to memories — a
-        claim is not a fact until somebody accepts it."""
-        return record_claim(c, run_id=self.run_id, workspace=self.ws)
+    def finding(self, f: "Finding") -> int:
+        """Record a finding for human review. Never writes to memories — a
+        finding is not a fact until somebody accepts it."""
+        return record_finding(f, run_id=self.run_id, workspace=self.ws)
 
     @property
     def ws(self) -> str:

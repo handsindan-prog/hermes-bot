@@ -2,10 +2,10 @@
 brain_research — work the [NEEDS RESEARCH] markers in a GTM brain.
 
 For each open marker it searches the Hermes corpus, and where the retrieved
-passages actually answer the question it proposes a claim with the verbatim
-text that claim rests on. Where they don't, it says so and states what would
+passages actually answer the question it records a finding with the verbatim
+text that finding rests on. Where they don't, it says so and states what would
 answer it. Nothing is written to the brain and nothing is written to memories:
-every output is a row in agent_claims, awaiting a human.
+every output is a row in agent_findings, awaiting a human.
 
 The rule this exists to obey:
 
@@ -14,7 +14,7 @@ The rule this exists to obey:
 
 That is enforced rather than requested. The model is only ever shown retrieved
 passages and asked whether they answer the question, and any quote it returns
-is checked to appear verbatim in the passage it cited. A claim whose quote
+is checked to appear verbatim in the passage it cited. A finding whose quote
 cannot be found is discarded, because a model that invents a quote will invent
 a company name.
 
@@ -58,15 +58,15 @@ products or markets beyond the passages given to you. If the passages do not
 answer the question, the answer is NO — that is a useful, expected result and
 you will not be penalised for it.
 
-Never state a company name, number, date or claim that does not appear in the
+Never state a company name, number, date or assertion that does not appear in the
 passages. Never infer a fact that the passages merely make plausible.
 
 Reply with JSON only, no prose and no code fence:
 
 {
   "answered": true|false,
-  "claim": "one sentence stating what the passages establish",
-  "passage": <the number of the single passage the claim rests on>,
+  "statement": "one sentence stating what the passages establish",
+  "passage": <the number of the single passage the finding rests on>,
   "evidence": "a verbatim span copied exactly from that passage",
   "confidence": "high"|"medium"|"low",
   "missing": "if answered is false, what a source would need to state"
@@ -74,8 +74,8 @@ Reply with JSON only, no prose and no code fence:
 
 "evidence" must be copied character-for-character from the passage. Do not
 tidy it, shorten mid-sentence with ellipses, or fix its punctuation — it is
-checked against the original and a claim whose quote cannot be found is thrown
-away.
+checked against the original and a finding whose quote cannot be found is
+thrown away.
 
 confidence: high if a passage states it outright; medium if it states it
 partially or in passing; low if it is only implied."""
@@ -209,34 +209,34 @@ async def investigate(m: Marker, workspaces: list[str], run: hc.AgentRun,
     quote = verdict.get("evidence", "")
     ok, where = quote_is_real(quote, uniq)
     if not ok:
-        # Treated as a failure of the run, not a soft claim. This is the
+        # Treated as a failure of the run, not a soft finding. This is the
         # fabrication case and it should be loud.
         return {"marker": m, "status": "quote-unverifiable",
-                "claim": verdict.get("claim", ""), "quote": quote, "why": where}
+                "statement": verdict.get("statement", ""), "quote": quote, "why": where}
 
     idx = verdict.get("passage")
     cited = uniq[idx - 1] if isinstance(idx, int) and 1 <= idx <= len(uniq) else uniq[0]
     meta = cited.get("metadata") or {}
     url = meta.get("url") or ""
 
-    claim = hc.Claim(
+    finding = hc.Finding(
         target=m.file,
         marker=f"{MARKER} {m.title}",
-        claim=verdict.get("claim", "").strip(),
+        statement=verdict.get("statement", "").strip(),
         evidence=quote.strip(),
         source_url=url or f"corpus:{where}",
         source_kind="corpus",
         confidence=verdict.get("confidence", "low"),
         fetched_at=(cited.get("created_at") or "")[:10] or None,
     )
-    claim_id = run.claim(claim)
-    return {"marker": m, "status": "claim", "claim": claim,
-            "claim_id": claim_id, "cited": cited}
+    finding_id = run.finding(finding)
+    return {"marker": m, "status": "finding", "finding": finding,
+            "finding_id": finding_id, "cited": cited}
 
 
 def report(results: list[dict], workspaces: list[str], run: hc.AgentRun) -> str:
     by = lambda s: [r for r in results if r["status"] == s]
-    claims, noev, nocorp = by("claim"), by("no-evidence"), by("no-corpus")
+    findings, noev, nocorp = by("finding"), by("no-evidence"), by("no-corpus")
     bad, unp = by("quote-unverifiable"), by("unparseable")
 
     L = [
@@ -245,7 +245,7 @@ def report(results: list[dict], workspaces: list[str], run: hc.AgentRun) -> str:
         f"Run {run.run_id} · {len(results)} markers · "
         f"{run.sources_fetched} passages retrieved · ${run.cost_usd:.4f}",
         "",
-        f"- **{len(claims)}** claims proposed (awaiting review)",
+        f"- **{len(findings)}** findings recorded (awaiting review)",
         f"- **{len(noev)}** retrieved something, but nothing that answers the question",
         f"- **{len(nocorp)}** nothing in the corpus is even close",
     ]
@@ -254,17 +254,17 @@ def report(results: list[dict], workspaces: list[str], run: hc.AgentRun) -> str:
     if unp:
         L.append(f"- **{len(unp)}** unparseable model output")
 
-    if claims:
-        L += ["", "## Proposed claims", "",
+    if findings:
+        L += ["", "## Findings", "",
               "Each rests on a verbatim quote checked against the retrieved passage.",
-              "Accept or reject in `agent_claims`; nothing has touched the brain.", ""]
-        for r in claims:
-            c = r["claim"]
-            L += [f"### {c.marker}",
-                  f"*{r['marker'].file}* · confidence **{c.confidence}** · claim #{r['claim_id']}",
-                  "", f"**Claim.** {c.claim}", "",
-                  f"> {c.evidence}", "",
-                  f"Source: `{c.source_url}` ({hc.label_of(r['cited'])}, "
+              "Accept or reject in `agent_findings`; nothing has touched the brain.", ""]
+        for r in findings:
+            f = r["finding"]
+            L += [f"### {f.marker}",
+                  f"*{r['marker'].file}* · confidence **{f.confidence}** · finding #{r['finding_id']}",
+                  "", f"**{f.statement}**", "",
+                  f"> {f.evidence}", "",
+                  f"Source: `{f.source_url}` ({hc.label_of(r['cited'])}, "
                   f"similarity {r['cited']['similarity']:.3f})", ""]
 
     if noev or nocorp:
@@ -279,7 +279,7 @@ def report(results: list[dict], workspaces: list[str], run: hc.AgentRun) -> str:
               "Treat these as a warning about the run, not as findings.", ""]
         for r in bad:
             L += [f"- **{r['marker'].file}** — {r['marker'].title}",
-                  f"  - claimed: {r['claim']}",
+                  f"  - asserted: {r['statement']}",
                   f"  - quote: `{r['quote'][:120]}`",
                   f"  - {r['why']}"]
 
@@ -289,14 +289,14 @@ def report(results: list[dict], workspaces: list[str], run: hc.AgentRun) -> str:
 async def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--brain", required=True, help="path to the brain repo")
-    ap.add_argument("--workspace", required=True, help="workspace to search and file claims under")
+    ap.add_argument("--workspace", required=True, help="workspace to search and file findings under")
     ap.add_argument("--also-search", nargs="*", default=[],
-                    help="additional workspaces to search (claims still file under --workspace)")
+                    help="additional workspaces to search (findings still file under --workspace)")
     ap.add_argument("--subdir", default="", help="limit to a subdirectory of brain/, e.g. vantage")
     ap.add_argument("--tier", choices=("smart", "fast"), default="smart",
                     help="smart = Claude via OpenRouter; fast = Nemotron via NVIDIA NIM. "
                          "The verbatim-quote check applies either way, so a weaker judge "
-                         "can propose a weak claim but cannot invent a source.")
+                         "can propose a weak finding but cannot invent a source.")
     ap.add_argument("--cap", type=float, default=0.50, help="spend cap in USD")
     ap.add_argument("--limit", type=int, default=0, help="stop after N markers (0 = all)")
     ap.add_argument("--dry-run", action="store_true", help="list markers and exit")

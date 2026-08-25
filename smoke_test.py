@@ -33,7 +33,7 @@ def check(label: str, ok: bool, detail: str = "") -> None:
 
 def cleanup() -> None:
     hc.supabase.table("memories").delete().eq("doc_key", DOC).execute()
-    hc.supabase.table("agent_claims").delete().eq("target", DOC).execute()
+    hc.supabase.table("agent_findings").delete().eq("target", DOC).execute()
     hc.supabase.table("agent_runs").delete().eq("agent", AGENT).execute()
 
 
@@ -110,28 +110,28 @@ async def main() -> None:
           bool(hits) and all(h.get("workspace") == "smoke-b" for h in hits),
           f"{len(hits)} hits, workspaces={sorted({h.get('workspace') for h in hits})}")
 
-    # --- claims are proposals, never facts ---
+    # --- findings are proposals, never facts ---
     async with hc.AgentRun(AGENT, workspace="smoke-a") as run:
-        cid = run.claim(hc.Claim(
+        fid = run.finding(hc.Finding(
             target=DOC, marker="NEEDS RESEARCH: test",
-            claim="Telecoms is the nearest adjacency.",
+            statement="Telecoms is the nearest adjacency.",
             evidence="telecoms, commercial waste, and managed print are the three nearest adjacencies",
             source_url="https://example.com/brief", source_kind="corpus",
             confidence="high", fetched_at="2026-08-24",
         ))
-    check("claim recorded against the run", cid > 0)
+    check("finding recorded against the run", fid > 0)
 
-    open_ = hc.open_claims(workspace="smoke-a", target=DOC)
-    check("claim is 'proposed', not fact", bool(open_) and open_[0]["status"] == "proposed")
+    open_ = hc.open_findings(workspace="smoke-a", target=DOC)
+    check("finding is 'proposed', not fact", bool(open_) and open_[0]["status"] == "proposed")
 
-    model_claim = hc.Claim(target=DOC, claim="Acme raised $40M.",
-                           source_kind="model", confidence="high")
-    check("a model-sourced claim is forced to unverified",
-          model_claim.confidence == "unverified",
-          f"got {model_claim.confidence!r}")
+    model_finding = hc.Finding(target=DOC, statement="Acme raised $40M.",
+                               source_kind="model", confidence="high")
+    check("a model-sourced finding is forced to unverified",
+          model_finding.confidence == "unverified",
+          f"got {model_finding.confidence!r}")
 
     try:
-        hc.Claim(target=DOC, claim="x", confidence="pretty sure")
+        hc.Finding(target=DOC, statement="x", confidence="pretty sure")
         check("invalid confidence rejected", False, "no error raised")
     except ValueError:
         check("invalid confidence rejected", True)
