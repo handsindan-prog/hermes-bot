@@ -47,7 +47,14 @@ EMBED_URL = "https://integrate.api.nvidia.com/v1/embeddings"
 # Changing this model invalidates every stored vector. They live in a different
 # space and are not comparable, so the corpus must be re-embedded — see
 # agents/reembed.py.
-EMBED_MODEL = os.getenv("HERMES_EMBED_MODEL", "nvidia/nemotron-3-embed-1b")
+# Third embedding model in 24 hours. nv-embedqa-e5-v5 was retired (410),
+# nemotron-3-embed-1b then began hanging — 3/3 ReadTimeouts at 30s while NIM
+# chat stayed healthy, so it is that model's endpoint, not the account.
+# llama-nemotron-embed-vl-1b-v2 also emits 2048 dims, so no schema change.
+#
+# NIM has proven unreliable for embeddings specifically. If this recurs, move
+# the embedding provider off NIM rather than picking a fourth model.
+EMBED_MODEL = os.getenv("HERMES_EMBED_MODEL", "nvidia/llama-nemotron-embed-vl-1b-v2")
 EMBED_DIMS = 2048
 
 # Two tiers on purpose. An agent sweeping thirty pages is ~90% mechanical
