@@ -219,7 +219,11 @@ async def main() -> int:
     if not bad and state["failing"] and not a.no_alert:
         telegram("✅ Hermes healthcheck recovered — all checks passing again.")
 
-    save_state({"failing": bool(bad), "last_alert": now if should_alert else state.get("last_alert", 0)})
+    # --no-alert is a test mode; persisting from it would make the next real
+    # run announce a recovery from a failure that was deliberately induced.
+    if not a.no_alert:
+        save_state({"failing": bool(bad),
+                    "last_alert": now if should_alert else state.get("last_alert", 0)})
 
     # Only record a run when something is wrong. An hourly check that logs
     # every pass buries the failures it exists to surface.
