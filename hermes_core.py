@@ -11,6 +11,7 @@ copy-pasting chunk/embed/store for the third time.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import os
@@ -35,27 +36,58 @@ log = logging.getLogger("hermes")
 NVIDIA_KEY = os.environ["NVIDIA_API_KEY"]
 OPENROUTER_KEY = os.environ["OPENROUTER_API_KEY"]
 
-EMBED_URL = "https://integrate.api.nvidia.com/v1/embeddings"
-# nv-embedqa-e5-v5 reached end of life on 2026-08-25T09:00Z and now returns 410.
-# nemotron-3-embed-1b is the only embedding model this account can actually call
-# — the others in /v1/models 404 — and it is asymmetric like the old one.
+# ---- embeddings -------------------------------------------------------------
 #
-# 2048 dims, which the original build rejected because ivfflat and hnsw cap at
-# 2000. That no longer applies: the index was dropped in migration 002 after it
-# turned out to be suppressing search, and exact search has no dimension limit.
+# Behind a provider seam because the model has changed three times in 24 hours:
+# nv-embedqa-e5-v5 retired outright (410), nemotron-3-embed-1b then hung on
+# every call, and two further NVIDIA embedding models turned out to be retired
+# while looking for a replacement. NIM chat stayed healthy throughout — it is
+# embeddings specifically that are unreliable there.
 #
-# Changing this model invalidates every stored vector. They live in a different
-# space and are not comparable, so the corpus must be re-embedded — see
-# agents/reembed.py.
-# Third embedding model in 24 hours. nv-embedqa-e5-v5 was retired (410),
-# nemotron-3-embed-1b then began hanging — 3/3 ReadTimeouts at 30s while NIM
-# chat stayed healthy, so it is that model's endpoint, not the account.
-# llama-nemotron-embed-vl-1b-v2 also emits 2048 dims, so no schema change.
+# Default is OpenAI: a published deprecation policy, and 1536 dims sits under
+# pgvector's 2000-dimension index cap, so a vector index remains possible if
+# the corpus ever outgrows exact search.
 #
-# NIM has proven unreliable for embeddings specifically. If this recurs, move
-# the embedding provider off NIM rather than picking a fourth model.
-EMBED_MODEL = os.getenv("HERMES_EMBED_MODEL", "nvidia/llama-nemotron-embed-vl-1b-v2")
-EMBED_DIMS = 2048
+# Providers differ in one way that matters. NVIDIA and Voyage are asymmetric —
+# a document and a query are embedded differently, and mixing them up silently
+# wrecks recall. OpenAI is symmetric and has no such parameter. The seam hides
+# that; callers keep passing "query" or "passage" regardless.
+EMBED_PROVIDER = os.getenv("HERMES_EMBED_PROVIDER", "openai")
+
+_EMBED_DEFAULTS = {
+    "openai": ("https://api.openai.com/v1/embeddings", "text-embedding-3-small", 1536),
+    "voyage": ("https://api.voyageai.com/v1/embeddings", "voyage-3", 1024),
+    "nvidia": ("https://integrate.api.nvidia.com/v1/embeddings",
+               "nvidia/llama-nemotron-embed-vl-1b-v2", 2048),
+}
+if EMBED_PROVIDER not in _EMBED_DEFAULTS:
+    raise ValueError(f"HERMES_EMBED_PROVIDER must be one of {sorted(_EMBED_DEFAULTS)}")
+
+_url, _model, _dims = _EMBED_DEFAULTS[EMBED_PROVIDER]
+EMBED_URL = os.getenv("HERMES_EMBED_URL", _url)
+EMBED_MODEL = os.getenv("HERMES_EMBED_MODEL", _model)
+EMBED_DIMS = int(os.getenv("HERMES_EMBED_DIMS", str(_dims)))
+
+_EMBED_KEY_VAR = {"openai": "OPENAI_API_KEY", "voyage": "VOYAGE_API_KEY",
+                  "nvidia": "NVIDIA_API_KEY"}[EMBED_PROVIDER]
+
+
+def _embed_request(texts: list[str], input_type: str) -> tuple[dict, dict]:
+    """Provider-specific body and headers for one batch."""
+    key = os.environ.get(_EMBED_KEY_VAR, "")
+    if not key:
+        raise RuntimeError(
+            f"{_EMBED_KEY_VAR} is not set, but HERMES_EMBED_PROVIDER={EMBED_PROVIDER}")
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+
+    if EMBED_PROVIDER == "openai":
+        # Symmetric: no input_type. dimensions is honoured by the -3 models.
+        return {"input": texts, "model": EMBED_MODEL, "dimensions": EMBED_DIMS}, headers
+    if EMBED_PROVIDER == "voyage":
+        return {"input": texts, "model": EMBED_MODEL,
+                "input_type": "query" if input_type == "query" else "document"}, headers
+    return {"input": texts, "model": EMBED_MODEL,
+            "input_type": input_type, "truncate": "END"}, headers
 
 # Two tiers on purpose. An agent sweeping thirty pages is ~90% mechanical
 # work — classify, extract, first-pass summarise — and paying Claude rates
@@ -76,6 +108,8 @@ FAST_MODEL = os.getenv("HERMES_FAST_MODEL", "nvidia/nemotron-3-nano-30b-a3b")
 CHUNK_WORDS = 250          # sized for the embedding model's 512-token limit
 CHUNK_OVERLAP = 40
 BATCH_SIZE = 16
+EMBED_TIMEOUT = 60
+EMBED_RETRIES = 3
 MIN_CHUNK_WORDS = 20
 INSERT_BATCH = 50
 MATCH_THRESHOLD = 0.25     # real matches cluster ~0.35; the useful band is narrow
@@ -263,24 +297,40 @@ def chunk_text(text: str) -> list[str]:
 
 async def embed_batch(texts: list[str], input_type: str) -> list[list[float]]:
     """
-    input_type matters and fails silently if wrong: 'passage' when storing,
-    'query' when searching. Mismatched types wreck recall without erroring.
+    input_type is 'passage' when storing and 'query' when searching. On
+    asymmetric providers, getting it wrong wrecks recall without erroring; on
+    OpenAI it is ignored.
+
+    Retries transient failures. Every embedding outage this week presented as a
+    timeout at least once, and a single blip should not fail an ingest of
+    hundreds of rows.
     """
     out: list[list[float]] = []
-    async with httpx.AsyncClient(timeout=60) as client:
+    async with httpx.AsyncClient(timeout=EMBED_TIMEOUT) as client:
         for i in range(0, len(texts), BATCH_SIZE):
             batch = texts[i:i + BATCH_SIZE]
-            r = await client.post(
-                EMBED_URL,
-                headers={"Authorization": f"Bearer {NVIDIA_KEY}"},
-                json={
-                    "input": batch,
-                    "model": EMBED_MODEL,
-                    "input_type": input_type,
-                    "truncate": "END",
-                },
-            )
-            r.raise_for_status()
+            payload, headers = _embed_request(batch, input_type)
+
+            for attempt in range(EMBED_RETRIES):
+                try:
+                    r = await client.post(EMBED_URL, headers=headers, json=payload)
+                    r.raise_for_status()
+                    break
+                except (httpx.TimeoutException, httpx.TransportError) as e:
+                    if attempt == EMBED_RETRIES - 1:
+                        raise
+                    log.warning("embed attempt %d/%d failed (%s), retrying",
+                                attempt + 1, EMBED_RETRIES, type(e).__name__)
+                    await asyncio.sleep(2 ** attempt)
+                except httpx.HTTPStatusError as e:
+                    # 4xx is a configuration or entitlement problem — a retired
+                    # model, a bad key — and retrying only delays the report.
+                    if e.response.status_code < 500:
+                        raise
+                    if attempt == EMBED_RETRIES - 1:
+                        raise
+                    await asyncio.sleep(2 ** attempt)
+
             data = sorted(r.json()["data"], key=lambda d: d["index"])
             out.extend(d["embedding"] for d in data)
     return out
