@@ -7,6 +7,7 @@ that has actually broken this system:
 
     embeddings   410 Gone — the model reached end of life mid-day
     openrouter   402 Payment Required — credit ran out mid-run
+    fast chat    410 Gone — nemotron-3-nano-30b-a3b retired 2026-09-01
     search       returned nothing while looking healthy (the ivfflat index),
                  and would do so again on any model/corpus dimension mismatch
     supabase     the store everything else depends on
@@ -106,11 +107,12 @@ async def check_openrouter() -> Check:
 
 
 async def check_fast_tier() -> Check:
-    c = Check("nim chat")
+    c = Check("fast chat")
     try:
         r = await hc.chat([{"role": "user", "content": "Reply with the single word: ok"}],
                           tier="fast", max_tokens=600, strict=False)
-        return c.passed(f"{hc.FAST_MODEL.split('/')[-1]} · {r.output_tokens} tok")
+        return c.passed(f"{hc.FAST_PROVIDER}/{hc.FAST_MODEL.split('/')[-1]} · "
+                        f"{r.output_tokens} tok · ${r.cost_usd:.6f}")
     except Exception as e:
         return c.failed(f"{type(e).__name__}: {str(e)[:110]}")
 

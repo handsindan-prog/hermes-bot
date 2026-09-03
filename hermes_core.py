@@ -89,21 +89,48 @@ def _embed_request(texts: list[str], input_type: str) -> tuple[dict, dict]:
     return {"input": texts, "model": EMBED_MODEL,
             "input_type": input_type, "truncate": "END"}, headers
 
-# Two tiers on purpose. An agent sweeping thirty pages is ~90% mechanical
-# work — classify, extract, first-pass summarise — and paying Claude rates
-# for it is the expensive way to do a cheap job. "smart" is for the single
-# final judgement; "fast" is for the volume underneath it.
+# ---- chat ------------------------------------------------------------------
 #
-# The fast default is measured, not guessed: on an identical classification
-# task nemotron-3-nano-30b-a3b spent 53 completion tokens where
-# nemotron-nano-9b-v2 spent 203 and nemotron-super-49b-v1.5 spent 271, all
-# three returning the same correct answer. Note that
-# llama-3.1-nemotron-70b-instruct appears in /v1/models but 404s on this
-# account — check a model actually answers before adopting it.
-SMART_URL = "https://openrouter.ai/api/v1/chat/completions"
+# Two tiers on purpose. An agent sweeping thirty pages is ~90% mechanical work —
+# classify, extract, first-pass summarise — and paying Claude rates for it is
+# the expensive way to do a cheap job. "smart" is for the single final
+# judgement; "fast" is for the volume underneath it.
+#
+# Behind a provider seam for the same reason embeddings are. NVIDIA retired
+# nemotron-3-nano-30b-a3b on 2026-09-01, the fifth NIM model to die inside a
+# week, and nothing on that account now serves general chat: the instruct models
+# 404 and mistral-nemotron times out.
+#
+# The fast default is gpt-4.1-mini specifically because it does not reason
+# before answering. Every Nemotron model billed a chain of thought against
+# max_tokens and returned it as content when starved — see ChatTruncated.
+_CHAT_PROVIDERS = {
+    "openai":     ("https://api.openai.com/v1/chat/completions", "OPENAI_API_KEY"),
+    "openrouter": ("https://openrouter.ai/api/v1/chat/completions", "OPENROUTER_API_KEY"),
+    "nvidia":     ("https://integrate.api.nvidia.com/v1/chat/completions", "NVIDIA_API_KEY"),
+}
+
+# USD per million tokens, input/output. Only needed where the provider does not
+# report spend itself; OpenRouter returns actual cost and is left out. Without
+# this the fast tier would log zero and the spend cap would not see it.
+_CHAT_PRICES = {
+    "gpt-4.1-mini": (0.40, 1.60),
+    "gpt-4.1-nano": (0.10, 0.40),
+    "gpt-4o-mini":  (0.15, 0.60),
+}
+
+SMART_PROVIDER = os.getenv("HERMES_SMART_PROVIDER", "openrouter")
 SMART_MODEL = os.getenv("HERMES_SMART_MODEL", "anthropic/claude-sonnet-5")
-FAST_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
-FAST_MODEL = os.getenv("HERMES_FAST_MODEL", "nvidia/nemotron-3-nano-30b-a3b")
+FAST_PROVIDER = os.getenv("HERMES_FAST_PROVIDER", "openai")
+FAST_MODEL = os.getenv("HERMES_FAST_MODEL", "gpt-4.1-mini")
+
+for _p in (SMART_PROVIDER, FAST_PROVIDER):
+    if _p not in _CHAT_PROVIDERS:
+        raise ValueError(f"chat provider must be one of {sorted(_CHAT_PROVIDERS)}, got {_p!r}")
+
+# Kept for the healthcheck and for log lines that name the endpoint.
+SMART_URL = _CHAT_PROVIDERS[SMART_PROVIDER][0]
+FAST_URL = _CHAT_PROVIDERS[FAST_PROVIDER][0]
 
 CHUNK_WORDS = 250          # sized for the embedding model's 512-token limit
 CHUNK_OVERLAP = 40
@@ -555,23 +582,27 @@ async def chat(
     rather than returning an empty string, because a silent "" is the kind of
     thing an agent will happily write into the corpus.
     """
-    if tier == "fast":
-        url, model, key = FAST_URL, FAST_MODEL, NVIDIA_KEY
-        payload = {"model": model, "messages": messages, "max_tokens": max_tokens}
-        headers = {"Authorization": f"Bearer {key}"}
+    provider, model = ((FAST_PROVIDER, FAST_MODEL) if tier == "fast"
+                       else (SMART_PROVIDER, SMART_MODEL))
+    url, key_var = _CHAT_PROVIDERS[provider]
+    key = os.environ.get(key_var, "")
+    if not key:
+        raise RuntimeError(f"{key_var} is not set, but the {tier} tier uses {provider}")
+
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    payload: dict = {"model": model, "messages": messages}
+
+    if provider == "openai":
+        # max_completion_tokens is the forward-compatible spelling; max_tokens
+        # is rejected outright by the newer models.
+        payload["max_completion_tokens"] = max_tokens
     else:
-        url, model, key = SMART_URL, SMART_MODEL, OPENROUTER_KEY
-        payload = {
-            "model": model,
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "usage": {"include": True},
-        }
-        headers = {
-            "Authorization": f"Bearer {key}",
-            "HTTP-Referer": "https://circularsmart.com",
-            "X-Title": "Hermes",
-        }
+        payload["max_tokens"] = max_tokens
+
+    if provider == "openrouter":
+        # Ask for actual spend so agent_runs.cost_usd is measured, not estimated.
+        payload["usage"] = {"include": True}
+        headers |= {"HTTP-Referer": "https://circularsmart.com", "X-Title": "Hermes"}
 
     async with httpx.AsyncClient(timeout=timeout) as client:
         r = await client.post(url, headers=headers, json=payload)
@@ -580,6 +611,13 @@ async def chat(
 
     usage = body.get("usage") or {}
     choice = body["choices"][0]
+    in_tok = usage.get("prompt_tokens", 0) or 0
+    out_tok = usage.get("completion_tokens", 0) or 0
+
+    cost = float(usage.get("cost", 0) or 0)
+    if not cost and model in _CHAT_PRICES:
+        pin, pout = _CHAT_PRICES[model]
+        cost = (in_tok * pin + out_tok * pout) / 1_000_000
     msg = choice.get("message") or {}
 
     text = (msg.get("content") or "").strip()
@@ -602,9 +640,9 @@ async def chat(
 
     return ChatResult(
         text=text,
-        input_tokens=usage.get("prompt_tokens", 0) or 0,
-        output_tokens=usage.get("completion_tokens", 0) or 0,
-        cost_usd=float(usage.get("cost", 0) or 0),
+        input_tokens=in_tok,
+        output_tokens=out_tok,
+        cost_usd=cost,
         model=model,
         reasoning=reasoning,
         truncated=truncated,
